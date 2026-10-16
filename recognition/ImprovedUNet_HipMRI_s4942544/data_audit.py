@@ -40,8 +40,10 @@ import matplotlib.pyplot as plt
 # occur rather than assuming this mapping is correct.
 EXPECTED_LABELS = {0: "background", 1: "body", 2: "bone", 3: "bladder", 4: "rectum", 5: "prostate"}
 
-# case_004_week_0_slice_12.nii.gz -> patient "004", week "0", slice 12
-NAME_RE = re.compile(r"case_(\d+)_week_(\d+)_slice_(\d+)")
+# Images are named  case_004_week_0_slice_12.nii.gz  and masks are typically
+# named  seg_004_week_0_slice_12.nii.gz  -- accept either prefix so both parse
+# to the same key: patient "004", week "0", slice 12.
+NAME_RE = re.compile(r"(?:case|seg)_(\d+)_week_(\d+)_slice_(\d+)")
 
 SPLITS = {
     "train":    ("keras_slices_train",    "keras_slices_seg_train"),
@@ -149,6 +151,10 @@ def plot_samples(root, report, out_dir, n=6):
             break
     if not candidates:
         candidates = stats["_paired_keys"][:n]
+    if not candidates:
+        print("WARNING: no paired training slices -- skipping sample figure")
+        return
+    n = min(n, len(candidates))
     picks = [candidates[i] for i in np.linspace(0, len(candidates) - 1, n).astype(int)]
 
     fig, axes = plt.subplots(2, n, figsize=(2.6 * n, 6))
@@ -200,6 +206,17 @@ def main():
     for split, (img_dir, seg_dir) in SPLITS.items():
         print(f"Auditing {split} ...", flush=True)
         report[split] = audit_split(args.root, img_dir, seg_dir)
+        r = report[split]
+        print(f"   {r['n_image_files']} images, {r['n_mask_files']} masks, {r['n_paired']} matched pairs", flush=True)
+        if r["n_paired"] == 0:
+            # Fail loudly with the evidence needed to fix the filename pattern,
+            # rather than crashing later with an unrelated-looking error.
+            img_dir_path, seg_dir_path = os.path.join(args.root, img_dir), os.path.join(args.root, seg_dir)
+            print(f"\nERROR: no image/mask pairs matched in '{split}'. Filename pattern not recognised.")
+            print("   example image names:", sorted(os.listdir(img_dir_path))[:3])
+            print("   example mask names: ", sorted(os.listdir(seg_dir_path))[:3])
+            print("   Unparsed filenames:", r["unparsed_filenames"][:5])
+            raise SystemExit(1)
 
     # ---- Leakage check: a patient must belong to exactly one split ----
     sets = {s: set(report[s]["patients"]) for s in SPLITS}
