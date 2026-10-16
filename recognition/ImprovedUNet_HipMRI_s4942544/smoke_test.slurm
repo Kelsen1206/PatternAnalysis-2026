@@ -6,8 +6,8 @@
 # Submit from this folder:  sbatch smoke_test.slurm
 #SBATCH --job-name=hipmri-smoke
 #SBATCH --partition=comp3710
+#SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
 #SBATCH --time=01:00:00
 #SBATCH --output=smoke_%j.out
 #SBATCH --error=smoke_%j.err
