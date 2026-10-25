@@ -7,6 +7,12 @@ conditions (same data, splits, augmentation, loss, optimiser and schedule):
     python train.py --model baseline --epochs 50
     python train.py --model improved --epochs 50
 
+The 3D Improved U-Net uses the same loss, optimiser, schedule, checkpoint rule
+and outputs, but trains on whole 3D volumes of the same patients (the split is
+read from map_2d_to_3d.py's output) with GPU-side augmentation:
+
+    python train.py --model improved3d --batch-size 2 --epochs 100
+
 Model selection uses the VALIDATION prostate Dice only. The test split is
 evaluated exactly once, at the end, with the selected checkpoint -- so the
 reported test score is not biased by any training decision.
@@ -24,15 +30,17 @@ import time
 import torch
 from torch.amp import GradScaler, autocast
 
-from dataset import DEFAULT_ROOT, get_dataloaders
-from modules import DiceCELoss, build_model, count_parameters
+from dataset import DEFAULT_ROOT, VOLUME_ROOT, VolumeAugment, get_dataloaders, get_volume_dataloaders
+from modules import MODELS, VOLUMETRIC, DiceCELoss, build_model, count_parameters
 from utils import SegMetrics, measure_latency, plot_history, save_json, set_seed
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train a HipMRI prostate segmentation model")
-    p.add_argument("--model", choices=["baseline", "improved"], required=True)
-    p.add_argument("--root", default=DEFAULT_ROOT, help="keras_slices_data directory")
+    p.add_argument("--model", choices=list(MODELS), required=True)
+    p.add_argument("--root", default=None, help="data directory (default: the Rangpur 2D or 3D data folder)")
+    p.add_argument("--mapping", default="mapping_out", help="3D only: output folder of map_2d_to_3d.py")
+    p.add_argument("--downsample", type=int, default=1, choices=[1, 2], help="3D only: downsampling factor")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -41,11 +49,17 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, default=None, help="use only N slices per split (smoke tests)")
     p.add_argument("--out", default=None, help="output directory (default runs/<model>)")
+    p.add_argument("--max-minutes", type=float, default=None,
+                   help="stop training early if the next epoch would exceed this budget, then still run "
+                        "the test evaluation (protects long 3D runs from the Slurm time limit)")
     return p.parse_args()
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None):
-    """One pass over `loader`. Trains if an optimizer is given, otherwise evaluates."""
+def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None, augment=None):
+    """
+    One pass over `loader`. Trains if an optimizer is given, otherwise evaluates.
+    `augment` (3D only) is a batched augmentation applied on the GPU during training.
+    """
     training = optimizer is not None
     model.train(training)
     metrics = SegMetrics()
@@ -54,6 +68,8 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None):
 
     for images, masks, _ in loader:
         images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+        if training and augment is not None:
+            images, masks = augment(images, masks)
         with torch.set_grad_enabled(training), autocast(device.type, enabled=use_amp):
             logits = model(images)
             loss = criterion(logits.float(), masks)
@@ -74,13 +90,23 @@ def main():
     out_dir = args.out or os.path.join("runs", args.model)
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    save_json(vars(args), os.path.join(out_dir, "config.json"))  # lets predict.py rebuild the model later
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
     t_load = time.time()
-    train_loader, val_loader, test_loader = get_dataloaders(
-        args.root, batch_size=args.batch_size, num_workers=args.workers, limit=args.limit)
+    volumetric = args.model in VOLUMETRIC
+    if volumetric:
+        train_loader, val_loader, test_loader = get_volume_dataloaders(
+            args.mapping, args.root or VOLUME_ROOT, batch_size=args.batch_size, num_workers=args.workers,
+            downsample=args.downsample, limit=args.limit)
+        augment, unit = VolumeAugment(), "volumes"
+    else:
+        train_loader, val_loader, test_loader = get_dataloaders(
+            args.root or DEFAULT_ROOT, batch_size=args.batch_size, num_workers=args.workers, limit=args.limit)
+        augment, unit = None, "slices"
+    input_shape = tuple(train_loader.dataset.images.shape[1:])
     print(f"Data loaded in {time.time() - t_load:.0f}s | train {len(train_loader.dataset)} | "
-          f"val {len(val_loader.dataset)} | test {len(test_loader.dataset)} slices")
+          f"val {len(val_loader.dataset)} | test {len(test_loader.dataset)} {unit} | input {input_shape}")
 
     model = build_model(args.model).to(device)
     n_params = count_parameters(model)
@@ -100,7 +126,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss, _ = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
+        train_loss, _ = run_epoch(model, train_loader, criterion, device, optimizer, scaler, augment)
         val_loss, val = run_epoch(model, val_loader, criterion, device)
         scheduler.step()
         epoch_time = time.time() - t0
@@ -120,6 +146,12 @@ def main():
               f"bone {d['bone']:.3f} | {epoch_time:.0f}s" + ("  *best*" if improved else ""), flush=True)
         save_json(history, os.path.join(out_dir, "history.json"))
         plot_history(history, os.path.join(out_dir, "curves.png"), f"{args.model} U-Net on HipMRI")
+        elapsed_min = (time.time() - t_train) / 60
+        if args.max_minutes and epoch < args.epochs and \
+                elapsed_min + 1.5 * epoch_time / 60 > args.max_minutes:
+            print(f"Time budget of {args.max_minutes:.0f} min reached after epoch {epoch}: stopping early "
+                  f"(best epoch {best_epoch}) and evaluating the best checkpoint.")
+            break
 
     train_time = time.time() - t_train
     peak_vram_gb = torch.cuda.max_memory_allocated() / 1024 ** 3 if device.type == "cuda" else None
@@ -127,12 +159,13 @@ def main():
     # ---- Final evaluation: best checkpoint, held-out test split, exactly once ----
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     test_loss, test = run_epoch(model, test_loader, criterion, device)
-    latency_ms = measure_latency(model, device)
+    latency_ms = measure_latency(model, device, shape=(1, 1) + input_shape)  # one slice, or one whole volume
 
     results = {
         "model": args.model,
         "best_epoch": best_epoch,
         "best_val_prostate_dice": best_dice,
+        "epochs_completed": len(history["train_loss"]),
         "test": test,
         "test_loss": test_loss,
         "resources": {
@@ -140,7 +173,8 @@ def main():
             "peak_train_vram_gb": peak_vram_gb,
             "mean_epoch_time_s": sum(history["epoch_time_s"]) / len(history["epoch_time_s"]),
             "total_train_time_s": train_time,
-            "inference_ms_per_slice": latency_ms,
+            ("inference_ms_per_volume" if volumetric else "inference_ms_per_slice"): latency_ms,
+            "input_shape": list(input_shape),
             "device": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
         },
         "config": vars(args),
@@ -156,8 +190,9 @@ def main():
     print(f"   prostate Dice target (>= 0.75): {test['prostate_dice']:.4f} [{target}]")
     r = results["resources"]
     vram = f"{r['peak_train_vram_gb']:.2f} GB" if r["peak_train_vram_gb"] is not None else "n/a (cpu)"
+    lat = f"{latency_ms:.2f} ms/{'volume' if volumetric else 'slice'}"
     print(f"RESOURCES: {r['parameters']:,} params | peak VRAM {vram} | "
-          f"{r['mean_epoch_time_s']:.1f}s/epoch | {r['inference_ms_per_slice']:.2f} ms/slice inference")
+          f"{r['mean_epoch_time_s']:.1f}s/epoch | {lat} inference")
     print("=" * 70)
     print(f"Saved to {out_dir}/: best.pt, history.json, curves.png, results.json")
 
