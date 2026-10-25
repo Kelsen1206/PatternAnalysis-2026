@@ -16,8 +16,13 @@ Two networks are defined so they can be compared under identical conditions:
                        upsampled and summed, so coarse levels contribute directly to the
                        output and receive gradient directly from the loss
 
-Both networks return raw logits of shape (N, num_classes, H, W); softmax is applied
-inside the loss / at inference.
+    ImprovedUNet3D The same Improved U-Net with every operation volumetric
+                   (Conv3d, InstanceNorm3d, Dropout3d), as in the original paper,
+                   for the HipMRI 3D volumes. It shares the building blocks
+                   below through their `dims` argument (2 or 3).
+
+The 2D networks return raw logits of shape (N, num_classes, H, W) and the 3D
+network (N, num_classes, D, H, W); softmax is applied inside the loss / at inference.
 
 Also defined here: DiceCELoss, the training objective shared by both models.
 
@@ -88,9 +93,15 @@ class BaselineUNet(nn.Module):
 # --------------------------------------------------------------------------- #
 # Improved U-Net (Isensee et al. 2017), adapted to 2D                          #
 # --------------------------------------------------------------------------- #
-def norm_act(channels):
+# Layer types for 2D slices or 3D volumes; every Improved U-Net block takes `dims`.
+CONV = {2: nn.Conv2d, 3: nn.Conv3d}
+NORM = {2: nn.InstanceNorm2d, 3: nn.InstanceNorm3d}
+DROPOUT = {2: nn.Dropout2d, 3: nn.Dropout3d}
+
+
+def norm_act(channels, dims=2):
     """Instance norm + leaky ReLU, as used throughout the Improved U-Net."""
-    return nn.Sequential(nn.InstanceNorm2d(channels, affine=True), nn.LeakyReLU(0.01, inplace=True))
+    return nn.Sequential(NORM[dims](channels, affine=True), nn.LeakyReLU(0.01, inplace=True))
 
 
 class ContextModule(nn.Module):
@@ -100,14 +111,14 @@ class ContextModule(nn.Module):
     so the module only has to learn a residual correction.
     """
 
-    def __init__(self, channels, dropout=0.3):
+    def __init__(self, channels, dropout=0.3, dims=2):
         super().__init__()
         self.block = nn.Sequential(
-            norm_act(channels),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.Dropout2d(dropout),
-            norm_act(channels),
-            nn.Conv2d(channels, channels, 3, padding=1),
+            norm_act(channels, dims),
+            CONV[dims](channels, channels, 3, padding=1),
+            DROPOUT[dims](dropout),
+            norm_act(channels, dims),
+            CONV[dims](channels, channels, 3, padding=1),
         )
 
     def forward(self, x):
@@ -117,10 +128,10 @@ class ContextModule(nn.Module):
 class EncoderLevel(nn.Module):
     """3x3 conv (stride 2 except at the first level) followed by a residual context module."""
 
-    def __init__(self, in_ch, out_ch, stride):
+    def __init__(self, in_ch, out_ch, stride, dropout=0.3, dims=2):
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1)
-        self.context = ContextModule(out_ch)
+        self.conv = CONV[dims](in_ch, out_ch, 3, stride=stride, padding=1)
+        self.context = ContextModule(out_ch, dropout, dims)
 
     def forward(self, x):
         x = self.conv(x)
@@ -130,12 +141,12 @@ class EncoderLevel(nn.Module):
 class UpsamplingModule(nn.Module):
     """Upsample x2 then a 3x3 conv that halves the number of feature maps."""
 
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, dims=2):
         super().__init__()
         self.block = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            norm_act(out_ch),
+            CONV[dims](in_ch, out_ch, 3, padding=1),
+            norm_act(out_ch, dims),
         )
 
     def forward(self, x):
@@ -145,13 +156,13 @@ class UpsamplingModule(nn.Module):
 class LocalisationModule(nn.Module):
     """3x3 conv (recombines upsampled + skip features) then a 1x1 conv that halves channels."""
 
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, dims=2):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, 3, padding=1),
-            norm_act(in_ch),
-            nn.Conv2d(in_ch, out_ch, 1),
-            norm_act(out_ch),
+            CONV[dims](in_ch, in_ch, 3, padding=1),
+            norm_act(in_ch, dims),
+            CONV[dims](in_ch, out_ch, 1),
+            norm_act(out_ch, dims),
         )
 
     def forward(self, x):
@@ -164,31 +175,32 @@ class ImprovedUNet(nn.Module):
 
     With a 256x128 input the bottleneck is 16x8. Segmentation maps taken from the
     decoder at 1/4 and 1/2 resolution are upsampled and summed into the
-    full-resolution map, as in the original architecture.
+    full-resolution map, as in the original architecture. Every spatial size of
+    the input must be divisible by 16 (four stride-2 downsamplings).
     """
 
-    def __init__(self, in_channels=1, num_classes=6, base=16, dropout=0.3):
+    def __init__(self, in_channels=1, num_classes=6, base=16, dropout=0.3, dims=2):
         super().__init__()
         c = [base * 2 ** i for i in range(5)]  # 16, 32, 64, 128, 256
-        self.enc1 = EncoderLevel(in_channels, c[0], stride=1)
-        self.enc2 = EncoderLevel(c[0], c[1], stride=2)
-        self.enc3 = EncoderLevel(c[1], c[2], stride=2)
-        self.enc4 = EncoderLevel(c[2], c[3], stride=2)
-        self.enc5 = EncoderLevel(c[3], c[4], stride=2)  # bottleneck
+        self.enc1 = EncoderLevel(in_channels, c[0], stride=1, dropout=dropout, dims=dims)
+        self.enc2 = EncoderLevel(c[0], c[1], stride=2, dropout=dropout, dims=dims)
+        self.enc3 = EncoderLevel(c[1], c[2], stride=2, dropout=dropout, dims=dims)
+        self.enc4 = EncoderLevel(c[2], c[3], stride=2, dropout=dropout, dims=dims)
+        self.enc5 = EncoderLevel(c[3], c[4], stride=2, dropout=dropout, dims=dims)  # bottleneck
 
-        self.up4 = UpsamplingModule(c[4], c[3])
-        self.loc4 = LocalisationModule(c[3] * 2, c[3])
-        self.up3 = UpsamplingModule(c[3], c[2])
-        self.loc3 = LocalisationModule(c[2] * 2, c[2])
-        self.up2 = UpsamplingModule(c[2], c[1])
-        self.loc2 = LocalisationModule(c[1] * 2, c[1])
-        self.up1 = UpsamplingModule(c[1], c[0])
-        self.final_conv = nn.Sequential(nn.Conv2d(c[0] * 2, c[1], 3, padding=1), norm_act(c[1]))
+        self.up4 = UpsamplingModule(c[4], c[3], dims)
+        self.loc4 = LocalisationModule(c[3] * 2, c[3], dims)
+        self.up3 = UpsamplingModule(c[3], c[2], dims)
+        self.loc3 = LocalisationModule(c[2] * 2, c[2], dims)
+        self.up2 = UpsamplingModule(c[2], c[1], dims)
+        self.loc2 = LocalisationModule(c[1] * 2, c[1], dims)
+        self.up1 = UpsamplingModule(c[1], c[0], dims)
+        self.final_conv = nn.Sequential(CONV[dims](c[0] * 2, c[1], 3, padding=1), norm_act(c[1], dims))
 
         # Deep supervision: 1x1 segmentation layers at three decoder resolutions.
-        self.seg3 = nn.Conv2d(c[2], num_classes, 1)  # 1/4 resolution
-        self.seg2 = nn.Conv2d(c[1], num_classes, 1)  # 1/2 resolution
-        self.seg1 = nn.Conv2d(c[1], num_classes, 1)  # full resolution
+        self.seg3 = CONV[dims](c[2], num_classes, 1)  # 1/4 resolution
+        self.seg2 = CONV[dims](c[1], num_classes, 1)  # 1/2 resolution
+        self.seg1 = CONV[dims](c[1], num_classes, 1)  # full resolution
 
     def forward(self, x):
         e1 = self.enc1(x)
@@ -207,6 +219,18 @@ class ImprovedUNet(nn.Module):
         s = F.interpolate(s, scale_factor=2, mode="nearest") + self.seg2(d2)
         s = F.interpolate(s, scale_factor=2, mode="nearest") + self.seg1(d1)
         return s
+
+
+class ImprovedUNet3D(ImprovedUNet):
+    """
+    The volumetric Improved U-Net (Isensee et al. 2017 is itself 3D): identical
+    structure, with 3x3x3 convolutions, instance norm 3D, 3D dropout and 3D deep
+    supervision. Input (N, 1, D, H, W); on the 256x128x128 HipMRI crop the
+    bottleneck is 16x8x8.
+    """
+
+    def __init__(self, in_channels=1, num_classes=6, base=16, dropout=0.3):
+        super().__init__(in_channels, num_classes, base, dropout, dims=3)
 
 
 # --------------------------------------------------------------------------- #
@@ -232,10 +256,11 @@ class DiceCELoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits, target):
+        # Works for 2D (N, C, H, W) and 3D (N, C, D, H, W) logits alike.
         ce = F.cross_entropy(logits, target)
         probs = F.softmax(logits, dim=1)
-        onehot = F.one_hot(target, self.num_classes).permute(0, 3, 1, 2).float()
-        dims = (0, 2, 3)  # sum over batch and pixels -> one Dice score per class
+        onehot = F.one_hot(target, self.num_classes).movedim(-1, 1).float()
+        dims = (0,) + tuple(range(2, logits.ndim))  # sum over batch and voxels -> one Dice per class
         intersection = (probs * onehot).sum(dims)
         cardinality = (probs + onehot).sum(dims)
         dice = (2 * intersection + self.eps) / (cardinality + self.eps)
@@ -246,11 +271,12 @@ class DiceCELoss(nn.Module):
 # --------------------------------------------------------------------------- #
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
-MODELS = {"baseline": BaselineUNet, "improved": ImprovedUNet}
+MODELS = {"baseline": BaselineUNet, "improved": ImprovedUNet, "improved3d": ImprovedUNet3D}
+VOLUMETRIC = {"improved3d"}  # models that take whole 3D volumes instead of 2D slices
 
 
 def build_model(name, in_channels=1, num_classes=6):
-    """Factory used by train.py / predict.py: name is 'baseline' or 'improved'."""
+    """Factory used by train.py / predict.py: 'baseline', 'improved' or 'improved3d'."""
     if name not in MODELS:
         raise ValueError(f"Unknown model '{name}'. Choose from {list(MODELS)}")
     return MODELS[name](in_channels=in_channels, num_classes=num_classes)
