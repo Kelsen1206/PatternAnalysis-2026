@@ -9,12 +9,13 @@
 #
 # The training budget is kept below the Slurm limit so that, if the epochs do not
 # all fit, train.py stops early and still evaluates the best checkpoint.
-# --mem: every 3D training volume is held in RAM (~2.5 GB) on top of PyTorch itself.
+# Memory: the default allocation is used (as for the 2D jobs). Requesting --mem=32G
+# made the job unschedulable on this partition (reason BadConstraints). The 3D
+# training set needs ~2.5 GB of RAM (float16 images + uint8 masks).
 #SBATCH --job-name=hipmri-3d
 #SBATCH --partition=comp3710
 #SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
-#SBATCH --mem=32G
 #SBATCH --time=04:00:00
 #SBATCH --output=logs/train3d_%j.out
 #SBATCH --error=logs/train3d_%j.err

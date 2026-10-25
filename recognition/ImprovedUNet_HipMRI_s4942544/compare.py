@@ -50,6 +50,8 @@ RESOURCE_ROWS = [
     ("Inference per slice (ms; 3D: volume time / slices)", lambda r: r["resources"]["inference_ms_per_slice"], 2),
     ("Inference per scan (s)", lambda r: r["resources"]["inference_s_per_scan"], 2),
     ("Peak inference VRAM (GB)", lambda r: r["resources"]["peak_inference_vram_gb"], 2),
+    ("Latency for one input, batch of 1 (ms; 3D: one volume)",
+     lambda r: r["training"].get("inference_ms_per_slice", r["training"].get("inference_ms_per_volume")), 2),
 ]
 
 
@@ -71,7 +73,9 @@ def stat(runs, fn):
             continue
         if v is not None and not np.isnan(v):
             vals.append(v)
-    return (float(np.mean(vals)), float(np.std(vals)), len(vals)) if vals else (float("nan"), float("nan"), 0)
+    # Sample standard deviation (ddof=1): the seeds are a sample of possible training runs.
+    sd = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+    return (float(np.mean(vals)), sd, len(vals)) if vals else (float("nan"), float("nan"), 0)
 
 
 def table(runs, rows, models):
@@ -100,13 +104,16 @@ def main():
     seeds = {m: len(runs[m]) for m in models}
     print("Runs found:", seeds)
 
-    per_class_rows = [(f"{c} Dice", (lambda c: lambda r: r["per_class"][c]["dice"])(c), 3) for c in CLASSES[1:]]
+    per_class_rows = []
+    for c in CLASSES[1:]:
+        per_class_rows.append((f"{c} Dice", (lambda c: lambda r: r["per_class"][c]["dice"])(c), 3))
+        per_class_rows.append((f"{c} IoU", (lambda c: lambda r: r["per_class"][c]["iou"])(c), 3))
     md = [
         f"Mean ± standard deviation over random seeds ({', '.join(f'{LABELS[m]}: {n}' for m, n in seeds.items())}), "
         "held-out test split ({patients} patients, {slices} slices).".format(**runs[models[0]][0].get(
             "test_set", {"patients": "?", "slices": "?"})),
         "", "**Prostate accuracy and clinical error modes**", "", table(runs, ACCURACY_ROWS, models),
-        "", "**Per-class Dice**", "", table(runs, per_class_rows, models),
+        "", "**Per-class Dice and IoU**", "", table(runs, per_class_rows, models),
         "", "**Resource profile**", "", table(runs, RESOURCE_ROWS, models),
     ]
     with open(os.path.join(args.out, "comparison.md"), "w") as f:
