@@ -18,10 +18,9 @@ conda activate torch
 echo "Job $SLURM_JOB_ID on $(hostname), started $(date)"
 
 for ckpt in runs/*_s*/best.pt; do
-    run=$(basename "$(dirname "$ckpt")")      # e.g. improved_s0
-    model=${run%_s*}                           # e.g. improved
+    run=$(basename "$(dirname "$ckpt")")      # e.g. improved_s0, improved3d_s0
     echo "=== Evaluating $run ==="
-    python predict.py --model "$model" --ckpt "$ckpt" --out "eval/$run"
+    python predict.py --ckpt "$ckpt" --out "eval/$run"   # model read from the run's config.json
 done
 
 python compare.py --eval-dir eval --out images

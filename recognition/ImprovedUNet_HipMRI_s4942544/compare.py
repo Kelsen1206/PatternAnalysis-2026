@@ -26,8 +26,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 CLASSES = ["background", "body", "bone", "bladder", "rectum", "prostate"]
-MODEL_ORDER = ["baseline", "improved"]
-LABELS = {"baseline": "2D U-Net (baseline)", "improved": "2D Improved U-Net"}
+MODEL_ORDER = ["baseline", "improved", "improved3d", "improved3d_ds2"]
+LABELS = {"baseline": "2D U-Net (baseline)", "improved": "2D Improved U-Net", "improved3d": "3D Improved U-Net",
+          "improved3d_ds2": "3D Improved U-Net (half resolution)"}
 
 # (row label, function extracting the value from one eval.json, decimals)
 ACCURACY_ROWS = [
@@ -46,7 +47,7 @@ RESOURCE_ROWS = [
     ("Peak training VRAM (GB)", lambda r: r["training"]["peak_train_vram_gb"], 2),
     ("Training time per epoch (s)", lambda r: r["training"]["mean_epoch_time_s"], 1),
     ("Total training time (min)", lambda r: r["training"]["total_train_time_s"] / 60, 1),
-    ("Inference per slice (ms)", lambda r: r["resources"]["inference_ms_per_slice"], 2),
+    ("Inference per slice (ms; 3D: volume time / slices)", lambda r: r["resources"]["inference_ms_per_slice"], 2),
     ("Inference per scan (s)", lambda r: r["resources"]["inference_s_per_scan"], 2),
     ("Peak inference VRAM (GB)", lambda r: r["resources"]["peak_inference_vram_gb"], 2),
 ]
@@ -57,7 +58,7 @@ def load_runs(eval_dir):
     for path in sorted(glob.glob(os.path.join(eval_dir, "*", "eval.json"))):
         with open(path) as f:
             r = json.load(f)
-        runs[r["model"]].append(r)
+        runs[r.get("variant", r["model"])].append(r)
     return runs
 
 

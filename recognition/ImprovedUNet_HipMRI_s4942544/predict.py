@@ -3,6 +3,13 @@ predict.py -- Load a trained model, run inference on the held-out test split,
 answer the research question, and produce the report figures.
 
     python predict.py --model improved --ckpt runs/improved_s0/best.pt --out eval/improved_s0
+    python predict.py --model improved3d --ckpt runs/improved3d_s0/best.pt --out eval/improved3d_s0
+
+The 3D model predicts each test VOLUME, and its prediction is then cut back into
+exactly the 540 2D test slices (using the slice map from map_2d_to_3d.py), so all
+models are scored on identical pixels with identical metrics. As a built-in
+alignment check, the ground truth is cut from the 3D label volume the same way
+and must equal the 2D ground-truth masks slice for slice.
 
 Beyond the standard per-class Dice/IoU, the evaluation is STRATIFIED, because a
 good global Dice can hide failures where the prostate is small:
@@ -41,8 +48,10 @@ matplotlib.use("Agg")  # headless plotting on Rangpur
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 
-from dataset import CLASS_NAMES, DEFAULT_ROOT, NUM_CLASSES, PROSTATE, HipMRISliceDataset
-from modules import build_model, count_parameters
+from dataset import (CLASS_NAMES, DEFAULT_ROOT, NUM_CLASSES, PROSTATE, VOLUME_ROOT, HipMRISliceDataset,
+                     crop_or_pad, load_volume_pair, preprocess_volume, unfit_volume)
+from map_2d_to_3d import TRANSFORMS
+from modules import MODELS, VOLUMETRIC, build_model, count_parameters
 
 EDGE_FRACTION = 0.2  # outer 20% of each scan's prostate extent counts as "edge"
 FP_MIN_PIXELS = 20   # a prediction smaller than this on a prostate-free slice is ignored as noise
@@ -56,12 +65,17 @@ LABEL_CMAP = ListedColormap(["#000000", "#d9a066", "#4caf50", "#e57373", "#7986c
 
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate a trained HipMRI segmentation model")
-    p.add_argument("--model", choices=["baseline", "improved"], required=True)
+    p.add_argument("--model", choices=list(MODELS), default=None,
+                   help="default: read from the run's config.json (written by train.py)")
     p.add_argument("--ckpt", required=True, help="path to best.pt written by train.py")
     p.add_argument("--root", default=DEFAULT_ROOT)
     p.add_argument("--out", required=True)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--limit", type=int, default=None, help="evaluate only N slices (debugging)")
+    p.add_argument("--mapping", default="mapping_out", help="3D only: output folder of map_2d_to_3d.py")
+    p.add_argument("--volume-root", default=VOLUME_ROOT, help="3D only: folder with semantic_MRs/")
+    p.add_argument("--downsample", type=int, default=None,
+                   help="3D only: must match training (default: read from the run's results.json)")
     return p.parse_args()
 
 
@@ -93,6 +107,68 @@ def run_inference(model, ds, device, batch_size):
         timings.append({"scan": "/".join(scan), "slices": len(idx), "seconds": time.perf_counter() - t0})
         preds[idx] = torch.cat(out).cpu().numpy().astype(np.uint8)
     return preds, timings
+
+
+@torch.no_grad()
+def run_inference_3d(model, ds, device, mapping_dir, volume_root, downsample):
+    """
+    Predict each test scan's 3D volume, then extract the prediction for every 2D
+    test slice so the 3D model is scored on exactly the same pixels as the 2D ones.
+
+    Returns predictions (N, H, W) uint8 aligned with `ds`, per-scan timings, and
+    alignment checks (including the label-resolution ceiling when downsampling).
+    """
+    with open(os.path.join(mapping_dir, "mapping_2d_3d.json")) as f:
+        mapping = json.load(f)
+    with open(os.path.join(mapping_dir, "volumes_3d.json")) as f:
+        volumes = json.load(f)
+    model.eval()
+    scans = defaultdict(list)
+    for i, m in enumerate(ds.meta):
+        scans[(m["patient"], m["week"])].append(i)
+
+    preds = np.zeros(ds.masks.shape, dtype=np.uint8)
+    ceiling = np.zeros(ds.masks.shape, dtype=np.uint8)  # ground truth after the down/up-sampling round trip
+    timings, mismatched, unmapped = [], 0, 0
+    for (patient, week), idx in sorted(scans.items()):
+        entry = mapping.get(f"case_{patient}_week_{week}")
+        if entry is None:
+            raise RuntimeError(f"case_{patient}_week_{week} has no 3D volume in {mapping_dir}/mapping_2d_3d.json")
+        image, label = load_volume_pair(volume_root, volumes[entry["volume"]])
+        x, small_label, placement = preprocess_volume(image, label, downsample)
+        x = torch.from_numpy(x.astype(np.float32))[None, None].to(device)
+        if not timings:
+            model(x)  # warm-up pass (kernel selection, memory allocation) so the first scan is timed fairly
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        logits = model(x)
+        if downsample > 1:  # back to the cropped full resolution before taking the argmax
+            logits = F.interpolate(logits.float(), scale_factor=downsample, mode="trilinear", align_corners=False)
+        pred = logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        timings.append({"scan": f"{patient}/{week}", "volume": entry["volume"], "slices": len(idx),
+                        "seconds": time.perf_counter() - t0})
+
+        native_pred = unfit_volume(pred, label.shape, placement)
+        up = small_label.repeat(downsample, 0).repeat(downsample, 1).repeat(downsample, 2) if downsample > 1 else None
+        native_ceiling = unfit_volume(up, label.shape, placement) if up is not None else label
+        transform, axis = TRANSFORMS[entry["transform"]], entry["axis"]
+        for i in idx:
+            k = entry["slice_to_3d_index"].get(str(ds.meta[i]["slice"]))
+            if k is None:
+                unmapped += 1
+                continue
+            take = lambda vol: crop_or_pad(np.ascontiguousarray(transform(np.take(vol, k, axis=axis))))
+            preds[i] = take(native_pred)
+            ceiling[i] = take(native_ceiling)
+            mismatched += int(not np.array_equal(take(label), ds.masks[i]))
+    checks = {"slices_without_3d_index": unmapped, "slices_where_3d_gt_differs_from_2d_gt": mismatched}
+    if downsample > 1:
+        checks["prostate_dice_ceiling_from_downsampling"] = overlap(ceiling == PROSTATE, ds.masks == PROSTATE)[0]
+    return preds, timings, checks
 
 
 # --------------------------------------------------------------------------- #
@@ -331,6 +407,19 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    run_dir = os.path.dirname(args.ckpt)
+    config = {}
+    for name in ["config.json", "results.json"]:  # config.json exists even if training was cut short
+        path = os.path.join(run_dir, name)
+        if os.path.exists(path) and not config:
+            with open(path) as f:
+                data = json.load(f)
+            config = data.get("config", data)
+    args.model = args.model or config.get("model")
+    if args.model is None:
+        raise SystemExit("Pass --model: no config.json/results.json found next to the checkpoint")
+    downsample = args.downsample or config.get("downsample", 1)
+
     model = build_model(args.model).to(device)
     model.load_state_dict(torch.load(args.ckpt, map_location=device))
     ds = HipMRISliceDataset(args.root, "test", augment=False, limit=args.limit)
@@ -338,8 +427,21 @@ def main():
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    preds, timings = run_inference(model, ds, device, args.batch_size)
+    train_results = os.path.join(run_dir, "results.json")
+    train_info = {}
+    if os.path.exists(train_results):
+        with open(train_results) as f:
+            train_info = json.load(f)
+    checks = {}
+    if args.model in VOLUMETRIC:
+        preds, timings, checks = run_inference_3d(model, ds, device, args.mapping, args.volume_root, downsample)
+        print(f"3D -> 2D alignment checks: {checks}")
+        if checks["slices_without_3d_index"] or checks["slices_where_3d_gt_differs_from_2d_gt"]:
+            print("WARNING: some test slices could not be aligned with their 3D volume -- see eval.json")
+    else:
+        preds, timings = run_inference(model, ds, device, args.batch_size)
     results, per_slice = evaluate(ds, preds)
+    results["alignment_checks_3d"] = checks or None
 
     total_s = sum(t["seconds"] for t in timings)
     results["resources"] = {
@@ -349,11 +451,11 @@ def main():
         "peak_inference_vram_gb": torch.cuda.max_memory_allocated() / 1024 ** 3 if device.type == "cuda" else None,
         "device": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
     }
-    train_results = os.path.join(os.path.dirname(args.ckpt), "results.json")
-    if os.path.exists(train_results):  # carry over training time / VRAM recorded by train.py
-        with open(train_results) as f:
-            results["training"] = json.load(f).get("resources", {})
+    if train_info:  # carry over training time / VRAM recorded by train.py
+        results["training"] = train_info.get("resources", {})
     results["model"] = args.model
+    # Models compared in the README; the half-resolution 3D run is reported as its own variant.
+    results["variant"] = args.model if downsample == 1 else f"{args.model}_ds{downsample}"
     results["test_set"] = {"slices": len(ds), "patients": len({m["patient"] for m in ds.meta}),
                            "scans": len(timings)}
     results["checkpoint"] = args.ckpt
