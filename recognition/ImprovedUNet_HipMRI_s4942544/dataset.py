@@ -22,6 +22,7 @@ Every item also carries metadata (patient, week, slice index, relative position 
 its scan). This is what later allows failures to be analysed at the prostate base
 and apex -- the end slices that the research question focuses on.
 """
+import json
 import math
 import os
 import re
@@ -205,6 +206,189 @@ def get_dataloaders(root=DEFAULT_ROOT, batch_size=16, num_workers=4, limit=None)
         DataLoader(train_ds, shuffle=True, drop_last=True, **loader_kwargs),
         DataLoader(val_ds, shuffle=False, **loader_kwargs),
         DataLoader(test_ds, shuffle=False, **loader_kwargs),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 3D volumes (for the 3D Improved U-Net)                                       #
+# --------------------------------------------------------------------------- #
+# Design decisions (backed by map_2d_to_3d.py run on the real data):
+#
+# * Volumes are 256 x 256 x 128 voxels (~1.6 x 1.6 x 1.56 mm), stored in LPS
+#   order: axis 0 = left-right, axis 1 = anterior-posterior, axis 2 = superior-
+#   inferior. Each 2D scan is 60 consecutive coronal slices (axis 1) of its volume.
+# * Splits: the volumes of each split are exactly the 3D counterparts of the 2D
+#   split's scans (splits_3d.json, written by map_2d_to_3d.py), so the 3D model
+#   is trained, validated and tested on the same patients as the 2D models.
+# * Geometry: the anterior-posterior axis is centre-cropped to 128 slices (the
+#   prostate lies well inside it; the crop keeps the full left-right and
+#   superior-inferior extent) giving a 256 x 128 x 128 input. Like the 2D
+#   pipeline this is cropping, not resizing, so labels are never interpolated.
+# * Optional downsampling (--downsample 2) averages 2x2x2 blocks of the image and
+#   takes the centre voxel of each block of the mask, giving 128 x 64 x 64.
+# * Intensity: per-volume z-score normalisation.
+# * Augmentation runs on the GPU, batched (VolumeAugment) -- a Slurm job has one
+#   CPU core, which is far too slow for 3D resampling.
+VOLUME_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
+VOLUME_SHAPE = (256, 128, 128)  # (left-right, anterior-posterior crop, superior-inferior)
+
+
+def fit_volume(arr, target=VOLUME_SHAPE):
+    """
+    Centre-crop / zero-pad every axis of a 3D array to `target` (no interpolation).
+    Returns the fitted array and the placement needed to undo it (see unfit_volume).
+    """
+    out = np.zeros(target, dtype=arr.dtype)
+    placement = []
+    for dim, size in enumerate(target):
+        n = arr.shape[dim]
+        if n >= size:
+            start = (n - size) // 2
+            placement.append((slice(start, start + size), slice(0, size)))
+        else:
+            start = (size - n) // 2
+            placement.append((slice(0, n), slice(start, start + n)))
+    out[tuple(p[1] for p in placement)] = arr[tuple(p[0] for p in placement)]
+    return out, placement
+
+
+def unfit_volume(arr, native_shape, placement, fill=0):
+    """Inverse of fit_volume: put a fitted array back into a native-sized one."""
+    out = np.full(native_shape, fill, dtype=arr.dtype)
+    out[tuple(p[0] for p in placement)] = arr[tuple(p[1] for p in placement)]
+    return out
+
+
+def downsample_volume(image, mask, factor):
+    """Average-pool the image and take the centre voxel of each block of the mask."""
+    if factor == 1:
+        return image, mask
+    img = F.avg_pool3d(torch.from_numpy(image.astype(np.float32))[None, None], factor)[0, 0].numpy()
+    off = factor // 2
+    return img, mask[off::factor, off::factor, off::factor] if mask is not None else None
+
+
+def load_volume_pair(root, info):
+    """Read one MR volume and its label volume (as listed in volumes_3d.json)."""
+    def read(path):
+        a = np.asarray(nib.load(path).dataobj)
+        while a.ndim > 3:
+            a = a[..., 0]
+        return np.ascontiguousarray(a)  # Nifti arrays are Fortran-ordered; slicing them is very slow
+    image = read(os.path.join(root, "semantic_MRs", info["mr_file"])).astype(np.float32)
+    label = read(os.path.join(root, "semantic_labels_only", info["label_file"])).astype(np.uint8)
+    if image.shape != label.shape:
+        raise ValueError(f"MR/label shape mismatch for {info['label_file']}: {image.shape} vs {label.shape}")
+    return image, label
+
+
+def preprocess_volume(image, label, downsample=1):
+    """Crop/pad, normalise and (optionally) downsample. Returns image, label, placement."""
+    image, placement = fit_volume(image)
+    label = fit_volume(label)[0] if label is not None else None
+    image = normalise(image)
+    image, label = downsample_volume(image, label, downsample)
+    return image, label, placement
+
+
+class VolumeAugment:
+    """
+    Batched, label-safe 3D augmentation applied on the GPU inside the training loop:
+    left-right flip, rotation (+/-10 deg in the axial plane) and isotropic scaling
+    (0.9-1.1), and brightness/contrast jitter. The mask is resampled with
+    nearest-neighbour, so it can only ever contain existing labels.
+    """
+
+    def __init__(self, max_rotate_deg=10.0, scale_range=(0.9, 1.1), p_flip=0.5, intensity_jitter=0.1):
+        self.max_rotate = math.radians(max_rotate_deg)
+        self.scale_range = scale_range
+        self.p_flip = p_flip
+        self.intensity_jitter = intensity_jitter
+
+    def __call__(self, images, masks):
+        # images (N, 1, LR, AP, SI) float, masks (N, LR, AP, SI) long, on any device
+        n, dev = images.shape[0], images.device
+        flip = torch.rand(n, device=dev) < self.p_flip
+        images = torch.where(flip[:, None, None, None, None], images.flip(2), images)
+        masks = torch.where(flip[:, None, None, None], masks.flip(1), masks)
+
+        angle = (torch.rand(n, device=dev) * 2 - 1) * self.max_rotate
+        scale = self.scale_range[0] + torch.rand(n, device=dev) * (self.scale_range[1] - self.scale_range[0])
+        cos, sin = torch.cos(angle) / scale, torch.sin(angle) / scale
+        # affine_grid orders coordinates (x, y, z) = (SI, AP, LR); rotate the LR-AP (axial) plane.
+        theta = torch.zeros(n, 3, 4, device=dev)
+        theta[:, 0, 0] = 1 / scale
+        theta[:, 1, 1], theta[:, 1, 2] = cos, -sin
+        theta[:, 2, 1], theta[:, 2, 2] = sin, cos
+        grid = F.affine_grid(theta, images.shape, align_corners=False)
+        # "border" pads with edge values (air), not 0 -- after z-scoring, 0 is mid-grey tissue intensity.
+        images = F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        masks = F.grid_sample(masks[:, None].float(), grid, mode="nearest", padding_mode="zeros",
+                              align_corners=False)[:, 0].long()
+
+        gain = 1 + (torch.rand(n, 1, 1, 1, 1, device=dev) * 2 - 1) * self.intensity_jitter
+        bias = (torch.rand(n, 1, 1, 1, 1, device=dev) * 2 - 1) * self.intensity_jitter
+        return images * gain + bias, masks
+
+
+class HipMRIVolumeDataset(Dataset):
+    """
+    HipMRI 3D volumes of one split, held in memory.
+
+    Returns (image, mask, meta):
+        image: (1, 256, 128, 128) float32 (or (1, 128, 64, 64) with downsample=2)
+        mask:  matching (D, H, W) int64 class indices in [0, 5]
+        meta:  dict with the volume name, e.g. "B040_Week0"
+    """
+
+    def __init__(self, split="train", mapping_dir="mapping_out", root=VOLUME_ROOT, downsample=1,
+                 limit=None, num_threads=8):
+        with open(os.path.join(mapping_dir, "splits_3d.json")) as f:
+            names = json.load(f)["splits"][split]
+        with open(os.path.join(mapping_dir, "volumes_3d.json")) as f:
+            info = json.load(f)
+        if limit:
+            names = names[:limit]
+        if not names:
+            raise RuntimeError(f"No 3D volumes listed for split '{split}' in {mapping_dir}/splits_3d.json")
+
+        def load(name):
+            image, label = load_volume_pair(root, info[name])
+            # Fraction of the prostate that survives the crop (should be 1.0).
+            kept = float((fit_volume(label)[0] == PROSTATE).sum() / max((label == PROSTATE).sum(), 1))
+            image, label, _ = preprocess_volume(image, label, downsample)
+            return image.astype(np.float16), label, kept
+
+        with ThreadPoolExecutor(max_workers=num_threads) as pool:
+            loaded = list(pool.map(load, names))
+        self.images = np.stack([v[0] for v in loaded])
+        self.masks = np.stack([v[1] for v in loaded])
+        self.meta = [{"volume": n} for n in names]
+        self.split = split
+        # Sanity check: the crop must not cut away any prostate.
+        self.prostate_kept = min(v[2] for v in loaded)
+        if self.prostate_kept < 0.999:
+            print(f"WARNING: the crop removed prostate voxels in a {split} volume "
+                  f"(min kept fraction {self.prostate_kept:.4f})")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = torch.from_numpy(self.images[idx].astype(np.float32)).unsqueeze(0)
+        mask = torch.from_numpy(self.masks[idx].astype(np.int64))
+        return image, mask, self.meta[idx]
+
+
+def get_volume_dataloaders(mapping_dir="mapping_out", root=VOLUME_ROOT, batch_size=2, num_workers=2,
+                           downsample=1, limit=None):
+    """Train (shuffled), validation and test loaders over 3D volumes. Augmentation is applied on the GPU."""
+    datasets = [HipMRIVolumeDataset(s, mapping_dir, root, downsample, limit) for s in ["train", "validate", "test"]]
+    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    return (
+        DataLoader(datasets[0], shuffle=True, drop_last=True, **loader_kwargs),
+        DataLoader(datasets[1], shuffle=False, **loader_kwargs),
+        DataLoader(datasets[2], shuffle=False, **loader_kwargs),
     )
 
 
