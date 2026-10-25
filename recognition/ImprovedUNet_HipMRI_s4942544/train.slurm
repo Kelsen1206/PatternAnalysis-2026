@@ -14,7 +14,7 @@
 #SBATCH --partition=comp3710
 #SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
-#SBATCH --time=03:00:00
+#SBATCH --time=01:15:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 
