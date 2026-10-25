@@ -6,11 +6,13 @@
 #   sbatch --export=ALL,MODEL=improved,SEED=1 train.slurm
 # Optional: EPOCHS=80 (default 50)
 #
-# Note: --cpus-per-task is deliberately absent -- the comp3710 partition left jobs
-# pending (PartitionConfig) when it was set. Two loader workers suit the single
-# CPU core the job then receives.
+# Note: --account=comp3710 is required -- the comp3710 partition only accepts jobs
+# charged to the comp3710 account, and otherwise leaves them pending with reason
+# PartitionConfig. Without --cpus-per-task the job gets one CPU core, which two
+# data-loader workers suit.
 #SBATCH --job-name=hipmri-train
 #SBATCH --partition=comp3710
+#SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --time=03:00:00
 #SBATCH --output=logs/train_%j.out

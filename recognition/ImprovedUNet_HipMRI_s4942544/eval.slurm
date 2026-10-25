@@ -6,6 +6,7 @@
 #   sbatch eval.slurm
 #SBATCH --job-name=hipmri-eval
 #SBATCH --partition=comp3710
+#SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --time=01:00:00
 #SBATCH --output=logs/eval_%j.out
