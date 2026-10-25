@@ -14,6 +14,7 @@ data/
 # Generated outputs (README figures are copied into images/ deliberately, which is NOT ignored)
 audit_out/
 outputs/
+mapping_out/
 runs/
 eval/
 logs/
