@@ -42,6 +42,14 @@ ACCURACY_ROWS = [
     ("Leak into rectum (% of prostate area)", lambda r: r["clinical_errors"]["leak_into_rectum_pct"], 2),
     ("False-positive prostate-free slices (%)", lambda r: r["clinical_errors"]["false_positive_slice_rate_pct"], 1),
 ]
+REVIEW_ROWS = [
+    ("Slices flagged for manual review (%)", lambda r: r["review_band"]["flagged_slices_pct"], 1),
+    ("Missed prostate area caught by the flag (%)", lambda r: r["review_band"]["missed_prostate_px_caught_pct"], 1),
+    ("False-positive area caught by the flag (%)", lambda r: r["review_band"]["false_positive_px_caught_pct"], 1),
+    ("Whole-slice omissions (count)", lambda r: r["review_band"]["omitted_slices"], 1),
+    ("Whole-slice omissions caught (%)", lambda r: r["review_band"]["omitted_slices_caught_pct"], 1),
+    ("Prostate Dice on auto-drafted (unflagged) slices", lambda r: r["review_band"]["prostate_dice_auto_drafted"], 3),
+]
 RESOURCE_ROWS = [
     ("Parameters (M)", lambda r: r["resources"]["parameters"] / 1e6, 2),
     ("Peak training VRAM (GB)", lambda r: r["training"]["peak_train_vram_gb"], 2),
@@ -113,6 +121,8 @@ def main():
         "held-out test split ({patients} patients, {slices} slices).".format(**runs[models[0]][0].get(
             "test_set", {"patients": "?", "slices": "?"})),
         "", "**Prostate accuracy and clinical error modes**", "", table(runs, ACCURACY_ROWS, models),
+        "", "**Review-band rule (flag the slices around each end of the predicted prostate extent)**", "",
+        table(runs, REVIEW_ROWS, models),
         "", "**Per-class Dice and IoU**", "", table(runs, per_class_rows, models),
         "", "**Resource profile**", "", table(runs, RESOURCE_ROWS, models),
     ]

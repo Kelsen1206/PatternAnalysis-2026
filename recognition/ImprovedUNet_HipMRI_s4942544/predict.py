@@ -25,7 +25,7 @@ good global Dice can hide failures where the prostate is small:
     bladder and rectum (organs at risk), and false-positive prostate on slices
     that contain none.
 
-All thresholds (EDGE_FRACTION, FP_MIN_PIXELS, BOUNDARY_TOL) are fixed here in
+All thresholds (EDGE_FRACTION, FP_MIN_PIXELS, BOUNDARY_TOL, REVIEW_MARGIN) are fixed here in
 advance and were not tuned on the test set.
 
 Outputs (in --out):
@@ -57,6 +57,7 @@ EDGE_FRACTION = 0.2  # outer 20% of each scan's prostate extent counts as "edge"
 FP_MIN_PIXELS = 20   # a prediction smaller than this on a prostate-free slice is ignored as noise
 BOUNDARY_TOL = 2     # boundary F-score tolerance, in pixels
 N_POSITION_BINS = 10
+REVIEW_MARGIN = 2    # review-band rule: slices within 2 of each end of the PREDICTED prostate extent
 BLADDER, RECTUM = 3, 4
 
 # Colours for the six labels in figures: background transparent, then body..prostate.
@@ -237,6 +238,47 @@ def prostate_strata(ds):
     return strata, position, has_prostate
 
 
+def review_band(ds, preds, margin=REVIEW_MARGIN):
+    """
+    Evaluate a reject-option rule a planner could apply without ground truth: for
+    every scan, flag for manual contouring the first and last `margin` slices of the
+    model's own predicted prostate extent plus `margin` slices beyond each end (the
+    whole scan if no prostate is predicted). Measures how much of the model's error
+    the flagged band catches, what it costs (slices to review), and how good the
+    remaining, automatically drafted slices are.
+    """
+    pp, tp = preds == PROSTATE, ds.masks == PROSTATE
+    present = pp.sum(axis=(1, 2)) > FP_MIN_PIXELS
+    flagged = np.zeros(len(ds), dtype=bool)
+    scans = defaultdict(list)
+    for i, m in enumerate(ds.meta):
+        scans[(m["patient"], m["week"])].append(i)
+    for idx in scans.values():
+        idx = sorted(idx, key=lambda i: ds.meta[i]["slice"])
+        pred_slices = [ds.meta[i]["slice"] for i in idx if present[i]]
+        for i in idx:
+            s = ds.meta[i]["slice"]
+            if not pred_slices:
+                flagged[i] = True
+            else:
+                lo, hi = min(pred_slices), max(pred_slices)
+                flagged[i] = (lo - margin <= s < lo + margin) or (hi - margin < s <= hi + margin)
+    fn, fp = tp & ~pp, pp & ~tp
+    gt_slices = tp.any(axis=(1, 2))
+    omitted = gt_slices & ~pp.any(axis=(1, 2))  # slices whose prostate was missed entirely
+    pct = lambda part, whole: float(100 * part / whole) if whole else float("nan")
+    return {
+        "margin_slices": margin,
+        "flagged_slices_pct": pct(flagged.sum(), len(ds)),
+        "flagged_prostate_slices_pct": pct((flagged & gt_slices).sum(), gt_slices.sum()),
+        "missed_prostate_px_caught_pct": pct(fn[flagged].sum(), fn.sum()),
+        "false_positive_px_caught_pct": pct(fp[flagged].sum(), fp.sum()),
+        "omitted_slices": int(omitted.sum()),
+        "omitted_slices_caught_pct": pct((omitted & flagged).sum(), omitted.sum()),
+        "prostate_dice_auto_drafted": overlap(pp[~flagged], tp[~flagged])[0],
+    }
+
+
 def evaluate(ds, preds):
     """Compute every metric reported in the README."""
     masks = ds.masks
@@ -279,6 +321,7 @@ def evaluate(ds, preds):
         sel = np.array([m["patient"] == p for m in ds.meta])
         per_patient[p] = overlap(pp[sel], tp[sel])[0]
     results["prostate_dice_per_patient"] = per_patient
+    results["review_band"] = review_band(ds, preds)
 
     per_slice = []
     for i in range(len(ds)):
@@ -460,7 +503,7 @@ def main():
                            "scans": len(timings)}
     results["checkpoint"] = args.ckpt
     results["settings"] = {"edge_fraction": EDGE_FRACTION, "fp_min_pixels": FP_MIN_PIXELS,
-                           "boundary_tolerance_px": BOUNDARY_TOL}
+                           "boundary_tolerance_px": BOUNDARY_TOL, "review_margin_slices": REVIEW_MARGIN}
 
     plot_examples(ds, preds, per_slice, os.path.join(args.out, "examples.png"))
     results["failure_cases"] = plot_failures(ds, preds, pick_failure_cases(per_slice),
@@ -482,6 +525,10 @@ def main():
     print(f"Under-contouring {c['under_contouring_pct']:.1f}% | leak into bladder {c['leak_into_bladder_pct']:.2f}% | "
           f"rectum {c['leak_into_rectum_pct']:.2f}% | false-positive slices {c['false_positive_slice_rate_pct']:.1f}%")
     print("Per-patient prostate Dice:", {k: round(v, 3) for k, v in results["prostate_dice_per_patient"].items()})
+    rb = results["review_band"]
+    print(f"Review band (+/-{rb['margin_slices']} slices at the predicted ends): flags {rb['flagged_slices_pct']:.1f}% "
+          f"of slices, catches {rb['missed_prostate_px_caught_pct']:.0f}% of missed prostate and "
+          f"{rb['omitted_slices_caught_pct']:.0f}% of omitted slices; auto-drafted Dice {rb['prostate_dice_auto_drafted']:.3f}")
     r = results["resources"]
     print(f"Inference: {r['inference_ms_per_slice']:.2f} ms/slice, {r['inference_s_per_scan']:.2f} s/scan")
     print(f"\nSaved to {args.out}/: eval.json, examples.png, failure_cases.png, dice_by_position.png")
