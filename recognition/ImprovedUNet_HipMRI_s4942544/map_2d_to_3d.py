@@ -26,7 +26,9 @@ import hashlib
 import json
 import os
 import re
+import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import nibabel as nib
 import numpy as np
@@ -35,7 +37,9 @@ ROOT = "/home/groups/comp3710/HipMRI_Study_open"
 SPLITS_2D = {"train": "keras_slices_seg_train", "validate": "keras_slices_seg_validate",
              "test": "keras_slices_seg_test"}
 NAME_2D = re.compile(r"seg_(\d+)_week_(\d+)_slice_(\d+)")
-NAME_3D = re.compile(r"(B\d+)_Week(\d+)_SEMANTIC")
+# Most volumes are named B006_Week0_SEMANTIC.nii.gz, but the prefix letter is not
+# guaranteed, so any letters + digits are accepted; anything unparsed is reported.
+NAME_3D = re.compile(r"([A-Za-z]+\d+)_Week(\d+)", re.IGNORECASE)
 
 # The eight ways a 2D array can be flipped/rotated (the dihedral group).
 TRANSFORMS = {
@@ -61,24 +65,31 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--root", default=ROOT)
     p.add_argument("--out", default="mapping_out")
+    p.add_argument("--threads", type=int, default=8)
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     # ------------------------------------------------------------------ 2D side
-    slices_2d = {}  # (patient, week, slice) -> (split, hash, has_prostate)
-    shapes_2d = Counter()
+    t0 = time.time()
+    jobs = []
     for split, d in SPLITS_2D.items():
         folder = os.path.join(args.root, "keras_slices_data", d)
         for f in os.listdir(folder):
             m = NAME_2D.search(f)
-            if not m:
-                continue
-            a = load(os.path.join(folder, f))
-            if a.ndim == 3:
-                a = a[:, :, 0]
-            shapes_2d[a.shape] += 1
-            slices_2d[(m.group(1), m.group(2), int(m.group(3)))] = (split, digest(a), bool((a == 5).any()), a.shape)
-    print(f"2D: {len(slices_2d)} mask slices, shapes {dict(shapes_2d)}", flush=True)
+            if m:
+                jobs.append((split, (m.group(1), m.group(2), int(m.group(3))), os.path.join(folder, f)))
+
+    def read_2d(job):
+        split, key, path = job
+        a = load(path)
+        if a.ndim == 3:
+            a = a[:, :, 0]
+        return key, (split, digest(a), bool((a == 5).any()), a.shape)
+
+    with ThreadPoolExecutor(args.threads) as pool:  # file reading dominates; threads overlap the I/O
+        slices_2d = dict(pool.map(read_2d, jobs))   # (patient, week, slice) -> (split, hash, has_prostate, shape)
+    shapes_2d = Counter(v[3] for v in slices_2d.values())
+    print(f"2D: {len(slices_2d)} mask slices, shapes {dict(shapes_2d)} ({time.time() - t0:.0f}s)", flush=True)
     wanted_shapes = set(shapes_2d)
 
     # ------------------------------------------------------------------ 3D side
@@ -87,19 +98,30 @@ def main():
     mr_files = set(os.listdir(mr_dir))
     volumes = {}
     index = defaultdict(list)  # hash -> [(volume, axis, transform, slice index)]
-    for f in sorted(os.listdir(lab_dir)):
-        m = NAME_3D.search(f)
-        if not m:
-            continue
-        vol = f"{m.group(1)}_Week{m.group(2)}"
+    lab_files = sorted(f for f in os.listdir(lab_dir) if f.endswith((".nii", ".nii.gz")))
+    unparsed_3d = [f for f in lab_files if not NAME_3D.search(f)]
+    print(f"3D: {len(lab_files)} label files, {len(unparsed_3d)} with unparsed names {unparsed_3d[:5]}", flush=True)
+
+    def read_3d(f):
         img = nib.load(os.path.join(lab_dir, f))
-        lab = load(os.path.join(lab_dir, f)).astype(np.uint8)
-        mr_name = f"{vol}_LFOV.nii.gz"
-        mr_shape = list(nib.load(os.path.join(mr_dir, mr_name)).shape) if mr_name in mr_files else None
+        # Nifti data arrive in Fortran order; slicing that layout is ~1000x slower, so make it C-ordered.
+        return f, img, np.ascontiguousarray(np.asarray(img.dataobj), dtype=np.uint8)
+
+    t0 = time.time()
+    pool = ThreadPoolExecutor(args.threads)
+    for n_done, (f, img, lab) in enumerate(pool.map(read_3d, [f for f in lab_files if NAME_3D.search(f)]), 1):
+        while lab.ndim > 3:
+            lab = lab[..., 0]
+        m = NAME_3D.search(f)
+        vol = f"{m.group(1)}_Week{m.group(2)}"
+        # The matching MR volume: same "<id>_Week<n>_" stem, preferring the LFOV file.
+        mr_candidates = sorted(g for g in mr_files if g.lower().startswith(vol.lower() + "_"))
+        mr_name = next((g for g in mr_candidates if "LFOV" in g), mr_candidates[0] if mr_candidates else None)
+        mr_shape = list(nib.load(os.path.join(mr_dir, mr_name)).shape) if mr_name else None
         counts = np.bincount(lab.ravel(), minlength=6)
         volumes[vol] = {
             "patient": m.group(1), "week": m.group(2), "label_file": f,
-            "mr_file": mr_name if mr_name in mr_files else None, "mr_shape": mr_shape,
+            "mr_file": mr_name, "mr_shape": mr_shape,
             "shape": list(lab.shape), "spacing_mm": [round(float(z), 4) for z in img.header.get_zooms()[:3]],
             "orientation": "".join(nib.aff2axcodes(img.affine)),
             "labels": {str(i): int(c) for i, c in enumerate(counts) if c},
@@ -111,6 +133,9 @@ def main():
                     ts = t(s)
                     if ts.shape in wanted_shapes:
                         index[digest(ts)].append((vol, axis, tname, k))
+        if n_done % 20 == 0 or n_done == len(lab_files) - len(unparsed_3d):
+            print(f"   indexed {n_done} volumes ({time.time() - t0:.0f}s)", flush=True)
+    pool.shutdown()
     print(f"3D: {len(volumes)} label volumes indexed", flush=True)
 
     # ------------------------------------------------------------------ match
