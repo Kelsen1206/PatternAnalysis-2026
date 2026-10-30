@@ -32,13 +32,13 @@ Segmentation project · 2D Improved U-Net (Normal) extended to the 3D Improved U
 **How it works.** Three models share one data pipeline, one loss and one evaluation:
 - A **standard 2D U-Net** [1] is the baseline.
 - The **2D Improved U-Net** [2] (figure below) is the multi-scale-context model. It is an encoder–decoder network:
-  - The encoder downsamples with strided convolutions. At each of its five levels, a *residual context module* (two pre-activation convolutions with dropout, added back to its input) refines the features.
+  - The encoder downsamples with strided convolutions. At each of its five levels, a *residual context module* (two pre-activation convolutions with dropout, added back to its input [4]) refines the features.
   - The decoder upsamples. At each level, it concatenates the matching encoder features through a skip connection and recombines them with a *localisation module*.
   - **Deep supervision** takes segmentation maps from three decoder resolutions, upsamples them and sums them. Coarse, context-rich levels therefore contribute directly to the output and receive gradient straight from the loss.
-  - Instance normalisation and leaky ReLU keep training stable at small batch sizes.
-- The **3D Improved U-Net** keeps the same design with every operation made volumetric. It sees neighbouring slices directly instead of one slice at a time.
+  - Instance normalisation [5] and leaky ReLU keep training stable at small batch sizes.
+- The **3D Improved U-Net** keeps the same design with every operation made volumetric, as in the original 3D formulations [2], [3]. It sees neighbouring slices directly instead of one slice at a time.
 
-All models are trained with cross-entropy plus soft Dice, so the prostate (0.43% of pixels) is not swamped by background. All are tested on the same held-out patients. On top of global Dice, the evaluation splits the prostate score by slice position (edge vs central slices) and measures boundary accuracy, leakage into the bladder and rectum, and false alarms on slices without a prostate.
+All models are trained with cross-entropy plus soft Dice [6], so the prostate (0.43% of pixels) is not swamped by background. All are tested on the same held-out patients. On top of global Dice, the evaluation splits the prostate score by slice position (edge vs central slices) and measures boundary accuracy, leakage into the bladder and rectum, and false alarms on slices without a prostate.
 
 ![Improved U-Net architecture](images/architecture.png)
 
@@ -113,7 +113,7 @@ Both models exceed AC1 after 5 epochs and are well inside AC4. Notably, they are
 
 ### 3.1 Dataset
 
-The HipMRI prostate study (CSIRO), read from `/home/groups/comp3710/HipMRI_Study_open` on Rangpur. Two forms are used:
+The HipMRI prostate study (CSIRO) [7], read from `/home/groups/comp3710/HipMRI_Study_open` on Rangpur. Two forms are used:
 
 | Form | Location | Content |
 |---|---|---|
@@ -582,7 +582,7 @@ Hardware: NVIDIA A100 (Rangpur `comp3710` partition).
 
 ## 12. Artificial Intelligence Usage Disclosure
 
-**Tools used.** Anthropic's Claude (the Claude app, with Claude Code agent capabilities, model Opus 5.5) was used throughout the project as a programming and writing assistant.
+**Tools used.** Anthropic's Claude [8] (the Claude app, with Claude Code agent capabilities, model Opus 5.5) was used throughout the project as a programming and writing assistant.
 
 **What AI assisted with.**
 * Reading the assessment specification and planning the project scope and timeline, including the decision to start at Normal difficulty and extend to Hard.
@@ -614,18 +614,18 @@ I take full responsibility for every line of code, every formula and every numbe
 
 ## 13. References
 
-[1] O. Ronneberger, P. Fischer and T. Brox, "U-Net: Convolutional networks for biomedical image segmentation," in *Proc. MICCAI*, 2015, pp. 234–241.
+[1] O. Ronneberger, P. Fischer and T. Brox, "U-Net: Convolutional networks for biomedical image segmentation," in *Proc. MICCAI*, 2015, pp. 234–241. [arXiv:1505.04597](https://arxiv.org/abs/1505.04597)
 
-[2] F. Isensee, P. Kickingereder, W. Wick, M. Bendszus and K. H. Maier-Hein, "Brain tumor segmentation and radiomics survival prediction: Contribution to the BRATS 2017 challenge," in *Brainlesion: Glioma, Multiple Sclerosis, Stroke and TBI Models*, 2018, pp. 287–297. arXiv:1802.10508.
+[2] F. Isensee, P. Kickingereder, W. Wick, M. Bendszus and K. H. Maier-Hein, "Brain tumor segmentation and radiomics survival prediction: Contribution to the BRATS 2017 challenge," in *Brainlesion: Glioma, Multiple Sclerosis, Stroke and TBI Models*, 2018, pp. 287–297. [arXiv:1802.10508](https://arxiv.org/abs/1802.10508)
 
-[3] Ö. Çiçek, A. Abdulkadir, S. S. Lienkamp, T. Brox and O. Ronneberger, "3D U-Net: Learning dense volumetric segmentation from sparse annotation," in *Proc. MICCAI*, 2016, pp. 424–432.
+[3] Ö. Çiçek, A. Abdulkadir, S. S. Lienkamp, T. Brox and O. Ronneberger, "3D U-Net: Learning dense volumetric segmentation from sparse annotation," in *Proc. MICCAI*, 2016, pp. 424–432. [arXiv:1606.06650](https://arxiv.org/abs/1606.06650)
 
-[4] K. He, X. Zhang, S. Ren and J. Sun, "Identity mappings in deep residual networks," in *Proc. ECCV*, 2016, pp. 630–645. (Pre-activation residual blocks used in the context modules.)
+[4] K. He, X. Zhang, S. Ren and J. Sun, "Identity mappings in deep residual networks," in *Proc. ECCV*, 2016, pp. 630–645. [arXiv:1603.05027](https://arxiv.org/abs/1603.05027)
 
-[5] D. Ulyanov, A. Vedaldi and V. Lempitsky, "Instance normalization: The missing ingredient for fast stylization," arXiv:1607.08022, 2016.
+[5] D. Ulyanov, A. Vedaldi and V. Lempitsky, "Instance normalization: The missing ingredient for fast stylization," 2016. [arXiv:1607.08022](https://arxiv.org/abs/1607.08022)
 
-[6] F. Milletari, N. Navab and S.-A. Ahmadi, "V-Net: Fully convolutional neural networks for volumetric medical image segmentation," in *Proc. 3DV*, 2016, pp. 565–571. (Soft Dice loss.)
+[6] F. Milletari, N. Navab and S.-A. Ahmadi, "V-Net: Fully convolutional neural networks for volumetric medical image segmentation," in *Proc. 3DV*, 2016, pp. 565–571. [arXiv:1606.04797](https://arxiv.org/abs/1606.04797)
 
-[7] CSIRO, *HipMRI prostate study* (open release, provided by the COMP3710 teaching team on Rangpur).
+[7] J. Dowling and P. Greer, "Labelled weekly MR images of the male pelvis," v2, CSIRO Data Collection, 2021. [doi:10.25919/45t8-p065](https://doi.org/10.25919/45t8-p065)
 
-[8] Anthropic. (2025). Claude. Claude.Ai. https://claude.ai/new.
+[8] Anthropic, "Claude (Opus 5.5)," large language model, 2026. [Online]. Available: [https://claude.ai](https://claude.ai)
