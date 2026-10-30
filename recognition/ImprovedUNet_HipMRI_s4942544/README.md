@@ -627,3 +627,5 @@ I take full responsibility for every line of code, every formula and every numbe
 [6] F. Milletari, N. Navab and S.-A. Ahmadi, "V-Net: Fully convolutional neural networks for volumetric medical image segmentation," in *Proc. 3DV*, 2016, pp. 565–571. (Soft Dice loss.)
 
 [7] CSIRO, *HipMRI prostate study* (open release, provided by the COMP3710 teaching team on Rangpur).
+
+[8] Anthropic. (2025). Claude. Claude.Ai. https://claude.ai/new.
