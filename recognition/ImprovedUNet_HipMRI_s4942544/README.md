@@ -578,6 +578,16 @@ Exact versions as installed in the Rangpur `torch` conda environment used for ev
 
 Hardware: NVIDIA A100 (Rangpur `comp3710` partition).
 
+**Installing.** Python itself is not a pip package, so create the environment with the right interpreter first, then install the packages. `requirements.txt` points pip at the PyTorch package index for the CUDA 13.0 build:
+
+```bash
+conda create -n torch python=3.11.15
+conda activate torch
+pip install -r requirements.txt
+```
+
+On a machine without CUDA 13.0, install the matching PyTorch 2.13.0 build from [pytorch.org](https://pytorch.org/get-started/locally/) first, then the other three packages.
+
 ---
 
 ## 12. Artificial Intelligence Usage Disclosure
